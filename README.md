@@ -131,3 +131,42 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
 +50% si se implementa completamente en C, corriendo sobre Debian en BeagleBone Black con conexión Ethernet.
 
 ---
+
+## Implementación (C)
+
+`lab_3.c` implementa un **resolver DNS recursivo con caché en memoria** sobre UDP, no un proxy transparente:
+
+- **Arranca con la caché vacía** (no se persiste a disco; se pierde al reiniciar el proceso, como exige el lab).
+- **Cache hit:** si el `(nombre, tipo, clase)` ya está en la caché y no expiró (según su TTL), la respuesta se construye directamente ahí — "sale de tu laboratorio".
+- **Cache miss:** se reenvía la consulta **una sola vez** a un DNS público (recursividad), se parsean **todos** los Resource Records de la respuesta (Answer/Authority/Additional, con descompresión de nombres), se guardan en la caché, y la respuesta al cliente se reconstruye desde esos datos recién cacheados. Si el upstream no contesta (timeout ~2s), responde `SERVFAIL` en vez de fallar.
+- **Upstream por defecto:** Google `8.8.8.8` (fallback Cloudflare `1.1.1.1` si el primero no responde) — de la hoja PROVEEDORES. Se puede cambiar con `argv[2]`.
+- **Tipos con parsing/reconstrucción estructural completa:** `A`, `AAAA`, `CNAME`, `NS`, `PTR`, `SOA`, `MX` (por encima del mínimo de 3 que pide el lab). El resto (`TXT`, `SVCB`, `HTTPS`, `SRV`, `CAA`, etc.) se cachea y reconstruye como RDATA crudo, lo cual es válido porque esos tipos no comprimen nombres dentro de su RDATA.
+- **Multithreading:** thread pool fijo de 8 hilos (pthreads) + cola de tareas con mutex/cond; el hilo principal solo hace `recvfrom` y encola.
+- **Logs estructurados:** cada request/response se registra en stdout y en `dns_server.log` con timestamp, IP:puerto del cliente, qname, qtype, acción (`CACHE_HIT` / `CACHE_MISS_FORWARD` / `SERVFAIL` / `MALFORMED`) y tiempo de respuesta.
+
+### Cómo correr
+
+```bash
+make              # compila -> genera ./dns_server
+sudo make run     # escucha en el puerto 53 (requiere privilegios)
+make run PORT=5353  # o en un puerto sin privilegios, para pruebas
+```
+
+### Cómo probar
+
+```bash
+dig @127.0.0.1 -p 5353 google.com A      # 1ra vez: CACHE_MISS_FORWARD en el log
+dig @127.0.0.1 -p 5353 google.com A      # 2da vez: CACHE_HIT
+dig @127.0.0.1 -p 5353 google.com AAAA
+dig @127.0.0.1 -p 5353 google.com MX
+dig @127.0.0.1 -p 5353 google.com NS
+dig @127.0.0.1 -p 5353 -x 8.8.8.8         # PTR
+```
+
+Revisa `dns_server.log` para confirmar el formato de cada entrada y que no haya errores en consola.
+
+### Nota de plataforma
+
+El código usa headers POSIX (`arpa/inet.h`, `pthread.h`, `unistd.h`) — compila y corre en Linux/Debian/BeagleBone, no de forma nativa en Windows (se necesita WSL o una VM Linux).
+
+---
