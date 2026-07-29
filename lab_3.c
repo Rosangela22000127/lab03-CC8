@@ -299,6 +299,47 @@ static int cache_lookup(const char *name, uint16_t type, uint16_t class_,
     return (count > max_out) ? max_out : count;
 }
 
+/* Resuelve (name, type) siguiendo la cadena de CNAMEs.
+ *
+ * Los RR se cachean bajo el nombre de su DUENO, asi que para un alias como
+ * "www.github.com" el CNAME vive bajo el alias pero el registro A vive bajo
+ * "github.com". Una busqueda directa por (alias, A) no encuentra nada; hay que
+ * agregar el CNAME a la respuesta y repetir la busqueda sobre su destino.
+ *
+ * Devuelve cuantos RR quedaron en out (CNAMEs primero, luego los del tipo
+ * pedido) y pone *complete a 1 solo si se llego a registros del tipo pedido. */
+#define MAX_CNAME_DEPTH 8
+
+static int resolve_chain(const char *name, uint16_t type, uint16_t class_,
+                          cache_record_t *out, int max_out, int *complete) {
+    char current[MAX_NAME_LEN];
+    int count = 0;
+
+    *complete = 0;
+    strncpy(current, name, sizeof(current) - 1);
+    current[sizeof(current) - 1] = '\0';
+
+    for (int depth = 0; depth < MAX_CNAME_DEPTH && count < max_out; depth++) {
+        int n = cache_lookup(current, type, class_, out + count, max_out - count);
+        if (n > 0) {
+            count += n;
+            *complete = 1;
+            break;
+        }
+        if (type == T_CNAME) break; /* el CNAME era el tipo pedido: no hay cadena que seguir */
+
+        cache_record_t cn;
+        if (cache_lookup(current, T_CNAME, class_, &cn, 1) < 1) break;
+        if (cn.kind != RD_NAME) break; /* CNAME guardado como RDATA crudo: no se puede seguir */
+
+        out[count++] = cn;
+        strncpy(current, cn.data.target, sizeof(current) - 1);
+        current[sizeof(current) - 1] = '\0';
+    }
+
+    return count;
+}
+
 /* ---------- Parseo de Resource Records (usado para cachear la respuesta upstream) ---------- */
 
 /* Lee un RR completo en *pos (avanza *pos) y, si store!=0, lo guarda en cache.
@@ -694,13 +735,16 @@ static void handle_query(task_t *t) {
     qtype_to_str(qtype, qtype_str, sizeof(qtype_str));
 
     cache_record_t matches[32];
-    int mcount = cache_lookup(qname, qtype, qclass, matches, 32);
+    int complete = 0;
+    int mcount = resolve_chain(qname, qtype, qclass, matches, 32, &complete);
 
     uint8_t resp[BUFFER_SIZE];
     int resp_len;
     const char *action;
 
-    if (mcount > 0) {
+    /* Solo cuenta como hit si la cadena llego hasta registros del tipo pedido;
+     * un CNAME suelto sin su destino se reenvia para completarlo. */
+    if (complete) {
         resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
                                    matches, mcount, RCODE_NOERROR);
         action = "CACHE_HIT";
@@ -709,7 +753,7 @@ static void handle_query(task_t *t) {
         int uplen = forward_to_upstream(t->buf, t->len, upbuf, sizeof(upbuf));
         if (uplen > 0) {
             cache_response(upbuf, uplen);
-            mcount = cache_lookup(qname, qtype, qclass, matches, 32);
+            mcount = resolve_chain(qname, qtype, qclass, matches, 32, &complete);
             if (mcount > 0) {
                 resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
                                            matches, mcount, RCODE_NOERROR);
