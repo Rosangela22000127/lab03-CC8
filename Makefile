@@ -18,7 +18,12 @@ runjava:
 	javac UdpBroadcastSender.java && java UdpBroadcastSender
 
 killudp:
-	sudo kill -9 $(sudo lsof -t -iUDP:$(PORT))
+	@pids=$$(sudo lsof -t -iUDP:$(PORT)); \
+	if [ -n "$$pids" ]; then \
+		sudo kill -9 $$pids && echo "[+] Proceso(s) $$pids terminados (UDP:$(PORT))"; \
+	else \
+		echo "[!] No hay nada escuchando en UDP:$(PORT)"; \
+	fi
 
 clean:
 	rm -f $(OUT) dns_server.log

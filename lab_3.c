@@ -41,6 +41,7 @@
 #define QUEUE_CAP            64
 #define MAX_NAME_LEN         256
 #define RAW_RDATA_MAX        1024
+#define CACHE_MAX_ENTRIES    4096
 #define LOG_FILE             "dns_server.log"
 
 /* Tipos de registro (hoja LISTA TIPO REGISTROS (QTYPE)) */
@@ -208,6 +209,55 @@ static int write_name_compressed(const char *name, const char *qname, uint8_t *o
     return write_name_labels(name, out, out_cap);
 }
 
+/* ---------- EDNS0: cuanto le cabe al cliente ---------- */
+
+/* Salta un RR completo desde *pos, devolviendo su tipo y clase. */
+static int skip_rr(const uint8_t *buf, int buflen, int *pos, uint16_t *type_out, uint16_t *class_out) {
+    char tmp[MAX_NAME_LEN];
+    int n = read_name(buf, buflen, *pos, tmp, sizeof(tmp));
+    if (n < 0) return -1;
+    *pos += n;
+    if (*pos + 10 > buflen) return -1;
+    if (type_out)  *type_out  = read_u16(buf + *pos);
+    if (class_out) *class_out = read_u16(buf + *pos + 2);
+    uint16_t rdlength = read_u16(buf + *pos + 8);
+    *pos += 10 + rdlength;
+    return (*pos > buflen) ? -1 : 0;
+}
+
+/* Tamano UDP que el cliente anuncia por EDNS0 (RR OPT en Additional, donde el
+ * campo CLASS lleva el tamano). Devuelve 0 si la consulta no trae EDNS, en cuyo
+ * caso aplica el limite clasico de 512 bytes del RFC 1035. */
+static int query_edns_udp_size(const uint8_t *buf, int buflen) {
+    if (buflen < 12) return 0;
+
+    dns_header_t h;
+    parse_header(buf, &h);
+    if (h.arcount == 0) return 0;
+
+    int pos = 12;
+    for (int i = 0; i < h.qdcount; i++) {
+        char tmp[MAX_NAME_LEN];
+        int n = read_name(buf, buflen, pos, tmp, sizeof(tmp));
+        if (n < 0) return 0;
+        pos += n;
+        if (pos + 4 > buflen) return 0;
+        pos += 4;
+    }
+
+    int skip = h.ancount + h.nscount;
+    for (int i = 0; i < skip; i++) {
+        if (skip_rr(buf, buflen, &pos, NULL, NULL) < 0) return 0;
+    }
+
+    for (int i = 0; i < h.arcount; i++) {
+        uint16_t type = 0, class_ = 0;
+        if (skip_rr(buf, buflen, &pos, &type, &class_) < 0) return 0;
+        if (type == T_OPT) return class_;
+    }
+    return 0;
+}
+
 /* ---------- Cache en memoria ---------- */
 
 typedef enum { RD_RAW, RD_NAME, RD_SOA, RD_MX } rdata_kind_t;
@@ -240,7 +290,42 @@ typedef struct cache_record {
 } cache_record_t;
 
 static cache_record_t *g_cache = NULL;
+static int g_cache_count = 0;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Segundos que lleva cacheada la entrada. Devuelve 0 si el reloj retrocedio,
+ * para no convertir una resta negativa en un uint32 gigante ("todo expirado"). */
+static uint32_t cache_age(const cache_record_t *r, time_t now) {
+    double d = difftime(now, r->cached_at);
+    if (d < 0) return 0;
+    return (uint32_t)d;
+}
+
+static int cache_expired(const cache_record_t *r, time_t now) {
+    return cache_age(r, now) >= r->ttl;
+}
+
+/* Compara el RDATA de dos entradas. Se usa para descartar duplicados exactos
+ * sin borrar hermanos del mismo RRset (los 4 NS de google.com comparten
+ * name/type/class pero tienen RDATA distinto, y los cuatro deben conservarse). */
+static int rdata_equal(const cache_record_t *a, const cache_record_t *b) {
+    if (a->kind != b->kind) return 0;
+    switch (a->kind) {
+        case RD_RAW:
+            return a->data.raw.len == b->data.raw.len &&
+                   memcmp(a->data.raw.bytes, b->data.raw.bytes, a->data.raw.len) == 0;
+        case RD_NAME:
+            return strcasecmp(a->data.target, b->data.target) == 0;
+        case RD_SOA:
+            return a->data.soa.serial == b->data.soa.serial &&
+                   strcasecmp(a->data.soa.mname, b->data.soa.mname) == 0 &&
+                   strcasecmp(a->data.soa.rname, b->data.soa.rname) == 0;
+        case RD_MX:
+            return a->data.mx.preference == b->data.mx.preference &&
+                   strcasecmp(a->data.mx.exchange, b->data.mx.exchange) == 0;
+    }
+    return 0;
+}
 
 static void cache_insert(const char *name, uint16_t type, uint16_t class_, uint32_t ttl,
                           rdata_kind_t kind, const void *data_ptr, size_t data_size) {
@@ -274,8 +359,64 @@ static void cache_insert(const char *name, uint16_t type, uint16_t class_, uint3
     }
 
     pthread_mutex_lock(&g_cache_mutex);
+
+    /* Una sola pasada: libera lo expirado y el duplicado exacto de esta misma
+     * entrada (sin esto la lista solo crecia, y repetir una consulta que no se
+     * cachea -como un NXDOMAIN, que reenvia siempre- acumulaba copias del SOA
+     * de autoridad que luego salian repetidas en la respuesta). */
+    cache_record_t **pp = &g_cache;
+    while (*pp) {
+        cache_record_t *cur = *pp;
+        int dup = cur->type == r->type && cur->class_ == r->class_ &&
+                  strcasecmp(cur->name, r->name) == 0 && rdata_equal(cur, r);
+        if (dup || cache_expired(cur, r->cached_at)) {
+            *pp = cur->next;
+            free(cur);
+            g_cache_count--;
+        } else {
+            pp = &cur->next;
+        }
+    }
+
     r->next = g_cache;
     g_cache = r;
+    g_cache_count++;
+
+    /* Tope duro: si aun quedan demasiadas vigentes, se descarta la mas antigua
+     * (la cola de la lista) para que la memoria no crezca sin limite. */
+    while (g_cache_count > CACHE_MAX_ENTRIES) {
+        cache_record_t **tail = &g_cache;
+        while ((*tail)->next) tail = &(*tail)->next;
+        free(*tail);
+        *tail = NULL;
+        g_cache_count--;
+    }
+
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
+/* Borra el RRset completo de (name,type,class) y, de paso, todo lo expirado.
+ * Se llama antes de insertar los RR de una respuesta nueva: en DNS un RRset
+ * recibido REEMPLAZA al cacheado, no se suma a el. Sin esto quedaban versiones
+ * viejas conviviendo con las nuevas (visible con el SOA de .com, cuyo serial
+ * cambia cada pocos segundos, asi que ni siquiera son duplicados exactos). */
+static void cache_purge_rrset(const char *name, uint16_t type, uint16_t class_) {
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_cache_mutex);
+    cache_record_t **pp = &g_cache;
+    while (*pp) {
+        cache_record_t *cur = *pp;
+        int same_rrset = cur->type == type && cur->class_ == class_ &&
+                         strcasecmp(cur->name, name) == 0;
+        if (same_rrset || cache_expired(cur, now)) {
+            *pp = cur->next;
+            free(cur);
+            g_cache_count--;
+        } else {
+            pp = &cur->next;
+        }
+    }
     pthread_mutex_unlock(&g_cache_mutex);
 }
 
@@ -287,7 +428,7 @@ static int cache_lookup(const char *name, uint16_t type, uint16_t class_,
 
     pthread_mutex_lock(&g_cache_mutex);
     for (cache_record_t *r = g_cache; r != NULL; r = r->next) {
-        if ((uint32_t)(now - r->cached_at) >= r->ttl) continue; /* expirado */
+        if (cache_expired(r, now)) continue;
         if (r->class_ != class_) continue;
         if (r->type != type) continue;
         if (strcasecmp(r->name, name) != 0) continue;
@@ -340,11 +481,54 @@ static int resolve_chain(const char *name, uint16_t type, uint16_t class_,
     return count;
 }
 
+/* ---------- Secciones Authority y Additional ---------- */
+
+/* Busca (name,type) subiendo por la jerarquia: www.github.com -> github.com ->
+ * com. Sirve para hallar el NS o el SOA de la zona que cubre al nombre
+ * consultado, que es lo que va en la seccion Authority. */
+static int lookup_up_the_tree(const char *name, uint16_t type, uint16_t class_,
+                               cache_record_t *out, int max_out) {
+    const char *p = name;
+    for (int guard = 0; guard < 16 && *p; guard++) {
+        int n = cache_lookup(p, type, class_, out, max_out);
+        if (n > 0) return n;
+        const char *dot = strchr(p, '.');
+        if (!dot) break;
+        p = dot + 1;
+    }
+    return 0;
+}
+
+/* Reune el "glue" para la seccion Additional: las direcciones A/AAAA de los
+ * nombres a los que apuntan los RR de src (destinos NS y exchanges MX). */
+static int gather_glue(const cache_record_t *src, int src_count, uint16_t class_,
+                        cache_record_t *out, int max_out) {
+    int count = 0;
+
+    for (int i = 0; i < src_count && count < max_out; i++) {
+        const char *target = NULL;
+        if (src[i].type == T_NS && src[i].kind == RD_NAME) target = src[i].data.target;
+        else if (src[i].type == T_MX && src[i].kind == RD_MX) target = src[i].data.mx.exchange;
+        if (!target || !target[0]) continue;
+
+        count += cache_lookup(target, T_A, class_, out + count, max_out - count);
+        if (count < max_out) {
+            count += cache_lookup(target, T_AAAA, class_, out + count, max_out - count);
+        }
+    }
+    return count;
+}
+
 /* ---------- Parseo de Resource Records (usado para cachear la respuesta upstream) ---------- */
 
-/* Lee un RR completo en *pos (avanza *pos) y, si store!=0, lo guarda en cache.
+/* Modos de pasada sobre los RR de una respuesta upstream. */
+#define RR_PASS_PURGE  1  /* solo invalida el RRset viejo de cada RR */
+#define RR_PASS_INSERT 2  /* parsea el RDATA y cachea el RR */
+
+/* Lee un RR completo en *pos (avanza *pos) y lo procesa segun el modo.
  * Devuelve 0 en exito, -1 si el paquete esta corrupto/truncado. */
-static int parse_rr(const uint8_t *buf, int buflen, int *pos, int store) {
+static int parse_rr(const uint8_t *buf, int buflen, int *pos, int mode) {
+    int store = (mode == RR_PASS_INSERT);
     char name[MAX_NAME_LEN];
     int n = read_name(buf, buflen, *pos, name, sizeof(name));
     if (n < 0) return -1;
@@ -361,6 +545,12 @@ static int parse_rr(const uint8_t *buf, int buflen, int *pos, int store) {
 
     if (type == T_OPT) {
         *pos = rdata_start + rdlength; /* pseudo-RR EDNS0: se ignora, no se cachea */
+        return 0;
+    }
+
+    if (mode == RR_PASS_PURGE) {
+        cache_purge_rrset(name, type, class_);
+        *pos = rdata_start + rdlength;
         return 0;
     }
 
@@ -437,9 +627,8 @@ static int parse_rr(const uint8_t *buf, int buflen, int *pos, int store) {
     return 0;
 }
 
-/* Parsea Answer+Authority+Additional de una respuesta upstream y cachea cada RR. */
-static void cache_response(const uint8_t *buf, int buflen) {
-    if (buflen < 12) return;
+/* Recorre Answer+Authority+Additional de una respuesta upstream una vez. */
+static void cache_response_pass(const uint8_t *buf, int buflen, int mode) {
     dns_header_t h;
     parse_header(buf, &h);
 
@@ -455,8 +644,21 @@ static void cache_response(const uint8_t *buf, int buflen) {
 
     int total_rr = h.ancount + h.nscount + h.arcount;
     for (int i = 0; i < total_rr; i++) {
-        if (parse_rr(buf, buflen, &pos, 1) < 0) break;
+        if (parse_rr(buf, buflen, &pos, mode) < 0) break;
     }
+}
+
+/* Cachea una respuesta upstream en dos pasadas: primero invalida los RRsets
+ * viejos que la respuesta trae, y despues inserta los RR nuevos.
+ *
+ * Tiene que ser en dos pasadas: purgar e insertar RR por RR haria que los
+ * hermanos de un mismo RRset se borraran entre si (al llegar el 2do NS de
+ * google.com se eliminaria el 1ro, y solo sobreviviria el ultimo). Purgar la
+ * misma clave dos veces en la 1ra pasada es inofensivo: aun no se inserto nada. */
+static void cache_response(const uint8_t *buf, int buflen) {
+    if (buflen < 12) return;
+    cache_response_pass(buf, buflen, RR_PASS_PURGE);
+    cache_response_pass(buf, buflen, RR_PASS_INSERT);
 }
 
 /* ---------- Construccion de la respuesta hacia el cliente ---------- */
@@ -469,7 +671,13 @@ static int write_rr(uint8_t *buf, size_t cap, int pos, const cache_record_t *r, 
     if ((size_t)(pos + 8) > cap) return -1;
     write_u16(buf + pos, r->type); pos += 2;
     write_u16(buf + pos, r->class_); pos += 2;
-    write_u32(buf + pos, r->ttl); pos += 4;
+
+    /* Se envia el TTL RESTANTE, no el original: si se mandara siempre el valor
+     * completo, el cliente creeria que el dato acaba de nacer y lo guardaria
+     * mas tiempo del que le queda de vida real aqui. */
+    uint32_t age = cache_age(r, time(NULL));
+    uint32_t ttl_left = (age >= r->ttl) ? 1 : (r->ttl - age);
+    write_u32(buf + pos, ttl_left); pos += 4;
 
     int rdlen_pos = pos;
     pos += 2;
@@ -516,11 +724,47 @@ static int write_rr(uint8_t *buf, size_t cap, int pos, const cache_record_t *r, 
     return pos;
 }
 
+/* RR OPT (EDNS0) para la seccion Additional: nombre raiz, tipo 41, y en el
+ * campo CLASS el tamano UDP que NOSOTROS aceptamos. Se devuelve solo si el
+ * cliente uso EDNS, como hace cualquier resolver que anuncia soporte. */
+static int write_opt_rr(uint8_t *buf, size_t cap, int pos) {
+    if ((size_t)(pos + 11) > cap) return -1;
+    buf[pos++] = 0;                                  /* nombre raiz */
+    write_u16(buf + pos, T_OPT); pos += 2;
+    write_u16(buf + pos, BUFFER_SIZE); pos += 2;     /* class = payload size */
+    write_u32(buf + pos, 0); pos += 4;               /* ext-rcode, version, flags */
+    write_u16(buf + pos, 0); pos += 2;               /* rdlength */
+    return pos;
+}
+
+/* Escribe una seccion completa. Si un RR no cabe dentro de limit, deja la
+ * posicion como estaba antes de ese RR y devuelve cuantos si entraron. */
+static int write_section(uint8_t *resp, size_t limit, int *pos,
+                          const cache_record_t *rrs, int count, const char *qname) {
+    int written = 0;
+    for (int i = 0; i < count; i++) {
+        int np = write_rr(resp, limit, *pos, &rrs[i], qname);
+        if (np < 0) break;
+        *pos = np;
+        written++;
+    }
+    return written;
+}
+
 static int build_response(uint8_t *resp, size_t cap,
                            uint16_t query_id, int rd,
                            const char *qname, uint16_t qtype, uint16_t qclass,
-                           cache_record_t *matches, int match_count, int rcode) {
+                           const cache_record_t *answers, int an_count,
+                           const cache_record_t *authority, int ns_count,
+                           const cache_record_t *additional, int ar_count,
+                           int rcode, int edns_udp) {
     if (cap < 12) return -1;
+
+    /* Cuanto puede recibir el cliente: lo que anuncio por EDNS0, o los 512
+     * bytes del RFC 1035 si no uso EDNS. Nunca mas que nuestro buffer. */
+    size_t limit = (edns_udp > 0) ? (size_t)edns_udp : 512;
+    if (limit > cap) limit = cap;
+    if (limit < 12) limit = 12;
 
     dns_header_t h;
     memset(&h, 0, sizeof(h));
@@ -534,31 +778,40 @@ static int build_response(uint8_t *resp, size_t cap,
     h.z = 0;
     h.rcode = rcode;
     h.qdcount = 1;
-    h.ancount = (uint16_t)match_count;
-    h.nscount = 0;
-    h.arcount = 0;
 
-    write_header(resp, &h);
     int pos = 12;
-
-    int qn = write_name_labels(qname, resp + pos, cap - (size_t)pos);
+    int qn = write_name_labels(qname, resp + pos, limit - (size_t)pos);
     if (qn < 0) return -1;
     pos += qn;
-    if ((size_t)(pos + 4) > cap) return -1;
+    if ((size_t)(pos + 4) > limit) return -1;
     write_u16(resp + pos, qtype); pos += 2;
     write_u16(resp + pos, qclass); pos += 2;
+    int end_of_question = pos;
 
-    int written = 0;
-    for (int i = 0; i < match_count; i++) {
-        int np = write_rr(resp, cap, pos, &matches[i], qname);
-        if (np < 0) break;
-        pos = np;
-        written++;
-    }
-    if (written != match_count) {
-        write_u16(resp + 6, (uint16_t)written); /* corrige ANCOUNT si no todo cupo */
+    h.ancount = (uint16_t)write_section(resp, limit, &pos, answers, an_count, qname);
+
+    /* Si la respuesta no cabe completa, se trunca a Question y se marca TC=1
+     * para que el cliente reintente por TCP, en vez de mandar datos a medias. */
+    if (h.ancount < an_count) {
+        h.tc = 1;
+        h.ancount = 0;
+        pos = end_of_question;
+    } else {
+        /* Authority y Additional son informativas: si no caben se omiten sin
+         * marcar TC (es lo que hacen los resolvers reales con el glue). */
+        h.nscount = (uint16_t)write_section(resp, limit, &pos, authority, ns_count, qname);
+        h.arcount = (uint16_t)write_section(resp, limit, &pos, additional, ar_count, qname);
     }
 
+    if (edns_udp > 0) {
+        int np = write_opt_rr(resp, limit, pos);
+        if (np > 0) {
+            pos = np;
+            h.arcount++;
+        }
+    }
+
+    write_header(resp, &h);
     return pos;
 }
 
@@ -566,6 +819,30 @@ static int build_response(uint8_t *resp, size_t cap,
 
 static char g_upstream_1[64] = DEFAULT_UPSTREAM_1;
 static char g_upstream_2[64] = DEFAULT_UPSTREAM_2;
+
+/* Copia la consulta agregandole EDNS0 si no lo trae, anunciando nuestro buffer.
+ *
+ * Es necesario porque la consulta al upstream NO debe heredar los limites del
+ * cliente: si un cliente sin EDNS pregunta por un RRset grande (p.ej. los TXT
+ * de google.com, ~1KB), reenviar su consulta tal cual hace que el upstream
+ * responda truncado a 512 bytes y sin registros, y entonces no habria nada que
+ * cachear. Se pide completo hacia afuera y ya se recorta al responderle a el. */
+static int query_with_edns(const uint8_t *query, int qlen, uint8_t *out, size_t out_cap) {
+    if ((size_t)qlen > out_cap) return -1;
+    memcpy(out, query, (size_t)qlen);
+
+    if (query_edns_udp_size(query, qlen) > 0) return qlen; /* ya trae OPT */
+    if ((size_t)(qlen + 11) > out_cap) return qlen;
+
+    int pos = write_opt_rr(out, out_cap, qlen);
+    if (pos < 0) return qlen;
+
+    dns_header_t h;
+    parse_header(out, &h);
+    h.arcount++;
+    write_header(out, &h);
+    return pos;
+}
 
 static int forward_to_upstream(const uint8_t *query, int qlen, uint8_t *out, size_t out_cap) {
     const char *servers[2] = { g_upstream_1, g_upstream_2 };
@@ -734,6 +1011,8 @@ static void handle_query(task_t *t) {
     char qtype_str[16];
     qtype_to_str(qtype, qtype_str, sizeof(qtype_str));
 
+    int edns_udp = query_edns_udp_size(t->buf, t->len);
+
     cache_record_t matches[32];
     int complete = 0;
     int mcount = resolve_chain(qname, qtype, qclass, matches, 32, &complete);
@@ -744,32 +1023,55 @@ static void handle_query(task_t *t) {
 
     /* Solo cuenta como hit si la cadena llego hasta registros del tipo pedido;
      * un CNAME suelto sin su destino se reenvia para completarlo. */
+    int rcode = RCODE_NOERROR;
     if (complete) {
-        resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
-                                   matches, mcount, RCODE_NOERROR);
         action = "CACHE_HIT";
     } else {
         uint8_t upbuf[BUFFER_SIZE];
-        int uplen = forward_to_upstream(t->buf, t->len, upbuf, sizeof(upbuf));
+        uint8_t upquery[BUFFER_SIZE];
+        int uqlen = query_with_edns(t->buf, t->len, upquery, sizeof(upquery));
+        if (uqlen < 0) { uqlen = t->len; memcpy(upquery, t->buf, (size_t)t->len); }
+        int uplen = forward_to_upstream(upquery, uqlen, upbuf, sizeof(upbuf));
         if (uplen > 0) {
             cache_response(upbuf, uplen);
             mcount = resolve_chain(qname, qtype, qclass, matches, 32, &complete);
-            if (mcount > 0) {
-                resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
-                                           matches, mcount, RCODE_NOERROR);
-            } else {
+            if (mcount == 0) {
                 dns_header_t uph;
                 parse_header(upbuf, &uph);
-                resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
-                                           NULL, 0, uph.rcode);
+                rcode = uph.rcode;
             }
             action = "CACHE_MISS_FORWARD";
         } else {
-            resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
-                                       NULL, 0, RCODE_SERVFAIL);
+            mcount = 0;
+            rcode = RCODE_SERVFAIL;
             action = "SERVFAIL";
         }
     }
+
+    /* Authority: si hay respuesta, los NS de la zona que cubre al nombre; si no
+     * la hay (NXDOMAIN / sin datos), el SOA de la zona, igual que un resolver
+     * real. Se omite cuando el propio qtype ya devolvio esos RR en Answer. */
+    cache_record_t authority[8], additional[16];
+    int ns_count = 0, ar_count = 0;
+
+    if (mcount > 0) {
+        if (qtype != T_NS && qtype != T_SOA) {
+            ns_count = lookup_up_the_tree(qname, T_NS, qclass, authority, 8);
+        }
+    } else {
+        ns_count = lookup_up_the_tree(qname, T_SOA, qclass, authority, 1);
+    }
+
+    /* Additional: direcciones de los nombres citados en Authority (NS) y en
+     * Answer (exchanges MX), para ahorrarle al cliente esas consultas. */
+    ar_count = gather_glue(authority, ns_count, qclass, additional, 16);
+    if (ar_count < 16) {
+        ar_count += gather_glue(matches, mcount, qclass, additional + ar_count, 16 - ar_count);
+    }
+
+    resp_len = build_response(resp, sizeof(resp), qh.id, qh.rd, qname, qtype, qclass,
+                               matches, mcount, authority, ns_count, additional, ar_count,
+                               rcode, edns_udp);
 
     if (resp_len > 0) {
         sendto(t->sockfd, resp, resp_len, 0, (struct sockaddr *)&t->client_addr, t->addrlen);
@@ -799,6 +1101,11 @@ static void handle_signal(int sig) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Linea a linea: sin esto, al redirigir la salida (make run > log.txt, | tee)
+     * stdout queda con buffer por bloques y los logs no aparecen hasta que el
+     * proceso termina, como si el servidor no estuviera registrando nada. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     int port = DEFAULT_PORT;
     if (argc > 1) {
         int p = atoi(argv[1]);
