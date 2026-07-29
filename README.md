@@ -144,29 +144,78 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder"
 - **Multithreading:** thread pool fijo de 8 hilos (pthreads) + cola de tareas con mutex/cond; el hilo principal solo hace `recvfrom` y encola.
 - **Logs estructurados:** cada request/response se registra en stdout y en `dns_server.log` con timestamp, IP:puerto del cliente, qname, qtype, acción (`CACHE_HIT` / `CACHE_MISS_FORWARD` / `SERVFAIL` / `MALFORMED`) y tiempo de respuesta.
 
-### Cómo correr
-
-```bash
-make              # compila -> genera ./dns_server
-sudo make run     # escucha en el puerto 53 (requiere privilegios)
-make run PORT=5353  # o en un puerto sin privilegios, para pruebas
-```
-
-### Cómo probar
-
-```bash
-dig @127.0.0.1 -p 5353 google.com A      # 1ra vez: CACHE_MISS_FORWARD en el log
-dig @127.0.0.1 -p 5353 google.com A      # 2da vez: CACHE_HIT
-dig @127.0.0.1 -p 5353 google.com AAAA
-dig @127.0.0.1 -p 5353 google.com MX
-dig @127.0.0.1 -p 5353 google.com NS
-dig @127.0.0.1 -p 5353 -x 8.8.8.8         # PTR
-```
-
-Revisa `dns_server.log` para confirmar el formato de cada entrada y que no haya errores en consola.
-
 ### Nota de plataforma
 
 El código usa headers POSIX (`arpa/inet.h`, `pthread.h`, `unistd.h`) — compila y corre en Linux/Debian/BeagleBone, no de forma nativa en Windows (se necesita WSL o una VM Linux).
+
+### Paso 0 (solo Windows): preparar WSL con Debian
+
+Si desarrollas en Windows, necesitas un entorno Linux real. La opción más simple es WSL con Debian (mismo target que pide el bonus de BeagleBone):
+
+```powershell
+# En PowerShell como Administrador, una sola vez:
+wsl --install -d Debian
+# reinicia si te lo pide; al abrir la ventana de Debian, crea tu usuario/contraseña de Linux
+```
+
+Dentro de esa ventana de Debian, instala las herramientas de compilación (una sola vez):
+
+```bash
+sudo apt update && sudo apt install -y build-essential dnsutils
+```
+
+### Compilar
+
+```bash
+cd "/mnt/c/ruta/a/tu/Lab03"   # tu carpeta del repo, montada bajo /mnt/c/...
+make
+```
+
+### Prueba rápida, sin privilegios (puerto 5353)
+
+**Ventana 1** (Debian) — deja el servidor corriendo en primer plano:
+
+```bash
+./dns_server 5353
+```
+
+**Ventana 2** (abre otra ventana "Debian" desde el menú inicio) — manda consultas:
+
+```bash
+dig @127.0.0.1 -p 5353 www.github.com A     # 1ra vez: CACHE_MISS_FORWARD en el log (ventana 1). Responde CNAME + A
+dig @127.0.0.1 -p 5353 www.github.com A     # repite: CACHE_HIT
+dig @127.0.0.1 -p 5353 google.com AAAA
+dig @127.0.0.1 -p 5353 google.com MX
+dig @127.0.0.1 -p 5353 google.com NS
+dig @127.0.0.1 -p 5353 google.com SOA
+dig @127.0.0.1 -p 5353 -x 8.8.8.8            # PTR
+```
+
+`Ctrl+C` en la ventana 1 para parar el servidor. Revisa también `dns_server.log` para confirmar el formato de cada entrada y que no haya errores en consola.
+
+### Prueba en el puerto real 53 (como lo pide el lab)
+
+El puerto 53 es privilegiado y necesita `sudo`:
+
+**Ventana 1:**
+
+```bash
+sudo ./dns_server        # usa el puerto 53 por defecto
+```
+
+**Ventana 2** (ya no hace falta `-p`, 53 es el default de `dig`):
+
+```bash
+dig @127.0.0.1 google.com A
+```
+
+### (Opcional/avanzado) Configurar tu equipo para usar 127.0.0.1 como DNS primario
+
+Esto es lo que pide literalmente el enunciado ("configura tu equipo..."), pero cambia la configuración real de red de tu máquina — para el entregable normalmente basta con la prueba anterior (`dig` directo al puerto 53). Si igual quieres esta demo extra:
+
+- **Windows:** Panel de Control → Redes e Internet → Centro de redes... → Cambiar configuración del adaptador → clic derecho en tu adaptador activo → Propiedades → "Protocolo de Internet versión 4 (TCP/IPv4)" → Propiedades → "Usar las siguientes direcciones de servidor DNS" → primario `127.0.0.1`, secundario `8.8.8.8`.
+- Deja `sudo ./dns_server` corriendo en WSL mientras pruebas (WSL2 reenvía el puerto de `127.0.0.1` automáticamente hacia Windows).
+- Limpia la caché de DNS: `ipconfig /flushdns` (cmd/PowerShell como administrador), luego `nslookup google.com` (sin especificar servidor) — debería resolver a través de tu servidor.
+- **Importante:** revierte el DNS del adaptador a "Obtener la dirección del servidor DNS automáticamente" al terminar, o te quedas sin resolución DNS si el proceso no está corriendo.
 
 ---
