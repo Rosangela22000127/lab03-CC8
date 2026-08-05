@@ -7,7 +7,7 @@ Este Laboratorio Consiste en la implementación de un servidor DNS utilizando el
 - Código en **Java** (`UdpBroadcastSender.java`) para enviar mensajes en modo broadcast sobre UDP.
 - Un Archivo Makefile para agiliar la compilacion y manejo de archivos.
 
-Este código es proporcionado para que lo utilice como ejemplo para inicar en la lectura del protocolo de DNS que utiliza su sistema operativo para comunicarse. 
+Este código es proporcionado para que lo utilice como ejemplo para inicar en la lectura del protocolo de DNS que utiliza su sistema operativo para comunicarse.
 
 ---
 
@@ -66,7 +66,7 @@ Implementar un **Servidor DNS** en Java que escuche en el puerto `53` (UDP), sea
 
 - Configura tu equipo para que use `127.0.0.1` como DNS primario. (Importante)
 - Agrega un DNS externo secundario como respaldo (Google, Cloudflare, etc.). (Opcional)
-- Limpia cachés DNS del sistema operativo antes de hacer pruebas: 
+- Limpia cachés DNS del sistema operativo antes de hacer pruebas:
 
 ```bash
 # Para Ubuntu 17.04 y superior (18.04)
@@ -219,3 +219,121 @@ Esto es lo que pide literalmente el enunciado ("configura tu equipo..."), pero c
 - **Importante:** revierte el DNS del adaptador a "Obtener la dirección del servidor DNS automáticamente" al terminar, o te quedas sin resolución DNS si el proceso no está corriendo.
 
 ---
+
+## Ejecución en BeagleBone Black (Debian) por Ethernet — bonus 150%
+
+Verificado sobre `BeagleBoard.org Debian Buster IoT Image 2020-04-06`, kernel `4.19.94-ti-r42`,
+arquitectura `armv7l`. Compila limpio con `-Wall -Wextra` (0 warnings) y corre con ~1.5 MB de RSS.
+
+### Topología
+
+Dos variantes; ambas cumplen el requisito de "Ethernet a un Router u otro Dispositivo":
+
+```
+A) Con router:            Mac ──router── BBB          (el BBB toma IP por DHCP del router)
+B) Cable directo:  WiFi ── Mac ──NAT──> adaptador USB-Ethernet ──cable── BBB
+```
+
+La opción B es la de la presentación (sin router propio): la Mac comparte su internet
+por el cable. **Ajustes → General → Compartir → Compartir Internet**, compartir desde
+*Wi-Fi* hacia el adaptador *USB 10/100/1000 LAN*. macOS levanta DHCP + NAT y queda como
+`192.168.2.1`, el BBB recibe `192.168.2.x`.
+
+### 1. En la Mac: verificar el enlace
+
+Después de conectar (o reconectar) el dongle, en una sola línea:
+
+```bash
+networksetup -listallhardwareports | grep -A1 "USB 10/100/1000 LAN" | grep Device; ifconfig | grep -q "inet 192.168.2.1" && echo "sharing OK" || echo "SHARING CAIDO"; grep -A1 name=beaglebone /var/db/dhcpd_leases | grep ip_address; ping -c2 -t3 192.168.2.2 >/dev/null && echo "ping OK" || echo "NO responde"
+```
+
+Salida esperada: `Device: en7` / `sharing OK` / `ip_address=192.168.2.2` / `ping OK`.
+
+- `SHARING CAIDO` → al desconectar el dongle macOS apaga Compartir Internet: apágalo y préndelo.
+- `Device:` distinto → si cambiaste de puerto USB-C, vuelve a marcar la casilla del adaptador nuevo.
+- `ip_address=` distinto → usa esa IP en todo lo que sigue.
+
+### 2. Copiar las fuentes y compilar en la placa
+
+`gcc` y `make` ya vienen en la imagen IoT; no hay que instalar nada.
+
+```bash
+ssh debian@192.168.2.2 'mkdir -p ~/lab03'
+scp lab_3.c Makefile debian@192.168.2.2:~/lab03/
+ssh debian@192.168.2.2 'cd ~/lab03 && make'
+```
+
+### 3. Liberar el puerto 53 (una sola vez)
+
+En estas imágenes `dnsmasq` ocupa el 53 (sirve la red por USB, que no se usa aquí). El
+`disable` evita que regrese tras reiniciar:
+
+```bash
+ssh -t debian@192.168.2.2 "sudo systemctl stop dnsmasq && sudo systemctl disable dnsmasq"
+```
+
+No afecta la resolución del propio BBB: su `/etc/resolv.conf` apunta al router / a la Mac,
+no a `127.0.0.1`.
+
+### 4. Arrancar el servidor
+
+En primer plano, para que los logs se vean en vivo durante la demo:
+
+```bash
+ssh debian@192.168.2.2
+cd ~/lab03 && sudo ./dns_server 53
+```
+
+### 5. Probar desde la Mac (cruzando el Ethernet)
+
+```bash
+dig @192.168.2.2 google.com A      # 1ra vez: CACHE_MISS_FORWARD (~35 ms)
+dig @192.168.2.2 google.com A      # 2da vez: CACHE_HIT (~1 ms)
+dig @192.168.2.2 google.com AAAA
+dig @192.168.2.2 google.com MX
+dig @192.168.2.2 google.com NS
+dig @192.168.2.2 google.com TXT
+dig @192.168.2.2 github.com SOA
+dig @192.168.2.2 -x 8.8.8.8                  # PTR
+dig @192.168.2.2 www.github.com A            # cadena CNAME -> ANSWER: 2
+dig @192.168.2.2 cloudflare.com TYPE65       # HTTPS
+dig @192.168.2.2 _dns.resolver.arpa TYPE64   # SVCB
+dig @192.168.2.2 noexiste-xyz.com A          # NXDOMAIN + SOA en Authority
+```
+
+En el log de la placa el cliente aparece como `192.168.2.1` (la Mac), que es la evidencia
+de que las consultas cruzan la red y no salen de `localhost`.
+
+Captura de paquetes en la placa, si no hay GUI para Wireshark:
+
+```bash
+sudo tcpdump -i eth0 -n udp port 53
+```
+
+### Notas de la plataforma
+
+- **`dig` viejo y los tipos nuevos:** las versiones anteriores a BIND 9.17 no reconocen
+  `HTTPS`/`SVCB` como tipo y lo interpretan como *nombre de host*, devolviendo registros A
+  sin haber consultado nunca el tipo 64/65. Usa siempre `TYPE65` y `TYPE64`.
+- **El reloj no tiene batería.** Al encender, el BBB arranca en `2000-01-01` hasta que NTP
+  lo corrige. Si el servidor se levanta en esa ventana, **los logs quedan con fecha del año
+  2000**. Antes de arrancarlo, confirma:
+  ```bash
+  timedatectl | grep -i synchron     # debe decir: System clock synchronized: yes
+  ```
+- **Zona horaria:** la imagen viene en UTC (6 horas adelante de Guatemala). Para que los
+  logs coincidan con la hora local: `sudo timedatectl set-timezone America/Guatemala`.
+- **Alimentación:** si el BBB se alimenta por USB desde el hub, desconectar el hub **reinicia
+  la placa** (y con eso muere el servidor y se pierde la caché). Con un cargador de 5V al
+  jack de barril queda independiente.
+- **El servidor no arranca solo** tras un reinicio: hay que volver a levantarlo por SSH.
+- **Cable FTDI:** sólo da consola serial (`screen /dev/cu.usbserial-XXXX 115200`), no
+  interviene en la operación. Conviene llevarlo igual: es la única vía de acceso si la red falla.
+- **Espacio en disco:** la imagen puede llenar el eMMC de 4 GB con logs rotados. Si `df -h /`
+  marca 100%, `sudo rm -f /var/log/*.1 /var/log/*.gz` libera el espacio (son rotados, ya no
+  los escribe nadie).
+
+---
+
+
+
